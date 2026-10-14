@@ -1,0 +1,222 @@
+% Running log of findings and decisions for the OCPP benign-traffic generator.
+% Bullet points only; updated during the project. Basis for the final report.
+\documentclass[11pt]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+\title{OCPP 1.6J Benign Traffic Generation -- Findings Log}
+\date{Started 2026-10-09}
+\begin{document}
+\maketitle
+
+\section{Goal and scope}
+\begin{itemize}
+  \item Realistic \emph{benign} OCPP 1.6J traffic (charger $\leftrightarrow$ backend) for anomaly detection.
+  \item Benign-only training; anomalies (DoS, billing fraud, idTag misuse, spoofing, injection, protocol violations) only in test data.
+  \item Generator is a means to an end: minimal, every line explainable.
+\end{itemize}
+
+\section{Existing datasets -- analysis}
+\begin{itemize}
+  \item \textbf{Coventry ``OCPP-Centric Hybrid Testbed'' (IEEE MEET 2025)} = our \texttt{benign\_1/2/3.csv}
+  \begin{itemize}
+    \item 70 engineered features, no raw payloads.
+    \item Script-driven: BootNotification every few seconds, $\sim$4\,600 transactions in $\sim$3\,h, only 20--69 Heartbeats.
+    \item Generator artifact: \texttt{connector\_id == transaction\_id} in every row.
+    \item Label-leaking columns (\texttt{is\_anomalous\_communication}, \texttt{*\_zscore}).
+  \end{itemize}
+  \item \textbf{CICEVSE2024 (UNB)}
+  \begin{itemize}
+    \item EVSE-A (real Grizzl-E): TLS to \texttt{ocpp.unitedchargers.com}; only sizes/timing visible.
+    \item Measured: Heartbeat every 60.0\,s (60\,B out / 90\,B in), WebSocket ping every $\sim$6\,s (3.4--10\,s), TLS reconnect every 1--5\,h.
+    \item EVSE-B (Raspberry Pi): plaintext ws on port 8765, but permessage-deflate and captures start mid-connection $\Rightarrow$ not decodable; 1\,Hz identical frames, likely not OCPP.
+    \item Benign: only $\sim$5\,h charging + $\sim$32\,h idle, one charger; no benign pcap for EVSE-B.
+    \item Attacks only network/host level (nmap scans, hping3 floods, slowloris, cryptojacking, backdoor); no OCPP-level attacks.
+  \end{itemize}
+  \item \textbf{Federated OCPP 1.6 IDS dataset (Zenodo 14887131, CC-BY)}
+  \begin{itemize}
+    \item Only public decodable real-hardware capture: ABB Terra 54 + SteVe, plaintext, no deflate.
+    \item ARP-spoofing MITM and attack scripts run through the whole capture $\Rightarrow$ no clean benign period.
+    \item Measured: Boot interval 60\,s; Heartbeat median 59.999\,s with second mode 62\,s; Heartbeat suppressed while other traffic flows; CP ws ping 30\,s, SteVe ping 900\,s; reconnect + BootNotification $\sim$every 4\,h; RTT p50 43\,ms / p95 108\,ms (Wi-Fi).
+  \end{itemize}
+  \item \textbf{lbbrhzn/ocpp (Home Assistant) GitHub issues}: $\sim$6\,200 real frames, $\sim$50 vendor/model combos; good for payload structure, weak for timing.
+  \item No public clean, multi-charger, real benign OCPP dataset exists.
+\end{itemize}
+
+\section{Literature -- data level}
+\begin{itemize}
+  \item Most OCPP IDS papers: flow features on CICEVSE2024, supervised, only DoS/recon.
+  \item Dalamagkas et al.\ 2025 (Federated OCPP 1.6): 2 of 4 attacks only detectable with OCPP message features.
+  \item Bean \& Manias 2026 survey: encrypted CICEVSE prevents learning application-layer baseline; anomaly detection largely missing.
+  \item Billing fraud, idTag misuse, injection, protocol violations invisible in TLS flows; DoS visible in both.
+  \item Industry (ENCS/ElaadNL, OCA, NIST IR 8473): monitoring at CPO/CSMS via logs and events.
+  \item Jahangir et al.\ 2024 (IEEE TSG): autoencoder on ACN-Data, session level only.
+\end{itemize}
+
+\section{Decisions}
+\begin{itemize}
+  \item Train on \textbf{decoded OCPP messages} (detector at the backend).
+  \item TLS only as ablation (\texttt{SSLKEYLOGFILE} capture: encrypted + decrypted view).
+  \item Behaviour from \textbf{ACN-Data} (Caltech/JPL/office001): arrivals, dwell, kWh, recurring users.
+  \item Generate offline on a virtual clock (fast); validate a sample live against SteVe.
+  \item Domain randomization: several vendor profiles instead of one ``perfect'' charger.
+  \item Realism measured with a discriminator test (goal AUC $\approx 0.5$).
+  \item Split by ACN day, hold out one site, anomalies only in test (1--5\,\%).
+\end{itemize}
+
+\section{ACN-Data}
+\begin{itemize}
+  \item Downloaded via API: 66\,745 sessions, 115 stations, 2018-04 to 2021-09.
+  \item No 0-kWh sessions $\Rightarrow$ failed sessions filtered out by ACN; failures must be fabricated.
+  \item \texttt{doneChargingTime} partly null; \texttt{userID} null for $\sim$half of Caltech sessions.
+  \item Time-series endpoint: measured charging current + pilot signal every $\sim$4\,s per session.
+  \item Docs say 1 time series per page; tested: 25 complete series per page work.
+  \item Early sessions (Sept 2018) have no time series.
+  \item Download speed limited by ACN server ($\sim$1.7 sessions/s, 25 per page, $\sim$9\,MB per page); run on own server in tmux.
+  \item Download scope: JPL + Caltech Jan--Mar 2019, office001 all of 2019 ($\sim$7\,900 sessions).
+  \item Measured curve: implied voltage 203\,V (assumed 208\,V); no taper, current fluctuates 28--32\,A due to ACN adaptive scheduling $\Rightarrow$ replaced synthetic taper curve.
+  \item Caveat: all curves from a smart-charging site.
+  \item Curve analysis (JPL 4\,052 + Caltech 2\,549 sessions, run on own server): sample every 4\,s; max current bimodal $\sim$32\,A / $\sim$16\,A (car on-board charger), Caltech also 8\,A.
+  \item Current starts $\sim$7\,s after plug-in (charging before identification at ACN).
+  \item \texttt{doneChargingTime} = last moment current flows (median 0\,s); car stays plugged in after full: median 166\,min (JPL), 40\,min (Caltech).
+  \item Pauses $\geq$2\,min during charging in 13--15\,\% of sessions $\Rightarrow$ added SuspendedEVSE (pilot 0) / SuspendedEV $\to$ Charging status changes.
+  \item Pilot signal changes median 78$\times$ (JPL) / 40$\times$ (Caltech) per session; current $\leq$ pilot in 99\,\% $\Rightarrow$ Current.Offered / Power.Offered now from the real pilot.
+  \item Taper at the end (last 10\,\% $<$ 70\,\% of median) in 34\,\% (JPL) / 52\,\% (Caltech) of sessions.
+  \item Implied voltage per site: 204\,V (JPL), 219\,V (Caltech) $\Rightarrow$ bug fixed: readings used fixed 208\,V; now per-session voltage.
+\end{itemize}
+
+\section{OCPP 1.6J protocol facts used}
+\begin{itemize}
+  \item Framing: \texttt{[2,id,Action,payload]}, \texttt{[3,id,payload]}, \texttt{[4,id,code,desc,details]}; one outstanding call per direction.
+  \item Schemas from \texttt{ocpp} Python library (official JSON schemas).
+  \item SteVe responses (source \texttt{CentralSystemService16\_Service.java}): Boot $\to$ status, currentTime, interval; unknown idTag $\to$ \texttt{Invalid}; \texttt{transactionId} = DB auto-increment.
+  \item Heartbeat interval is set by the backend, not the charger.
+\end{itemize}
+
+\section{Vendor profiles (sources)}
+\begin{itemize}
+  \item ABB Terra AC: boot strings from issue 1275; MeterValueSampleInterval 30\,s (ABB manual); measurands Current, Energy, Power, Voltage; \texttt{info:"null"}, \texttt{vendorErrorCode:"0x0000"}.
+  \item Grizzl-E: model ``Grizzl-E Smart Connect'' (22 chars, violates schema max 20 on the real device); \texttt{meterType} junk values; \texttt{location:"Body"}, \texttt{phase:"L1-N"}; timestamps end in \texttt{.001Z}.
+  \item Wallbox Pulsar Plus: Faulted/InternalError on boot then Available; connector-0 clock-aligned energy \texttt{"0.0"} outside transactions.
+  \item Other vendor defaults (Zaptec, Easee, Enel X, Alpitronic): Heartbeat 60--86\,400\,s, MeterValues 0--90\,s.
+\end{itemize}
+
+\section{Generator (implementation)}
+\begin{itemize}
+  \item \texttt{fetcher.py}: ACN API download (sessions and time series), resumable.
+  \item \texttt{profiles.py}: 3 vendor profiles, every value sourced or marked ASSUMPTION.
+  \item \texttt{generator.py}: per charger 4 steps -- calls, heartbeats, outages, wire (latency + SteVe responses).
+  \item \texttt{validate.py}: every frame against official schemas; order; meter monotonic.
+  \item JPL March 2019: 52 chargers, $\sim$5\,M frames, $\sim$1\,min runtime.
+  \item Bug found and fixed: Heartbeat sneaked in before every MeterValues (60\,s vs 60\,s); rule: no Heartbeat if a message is due within 1\,s.
+  \item Measured ACN current replaces the synthetic taper curve where a time series exists; synthetic curve kept only as fallback.
+  \item Calibration applied (v2): per-vendor session order, session-relative energy (ABB, Grizzl-E), vendor message-ID styles, vendor timestamp formats, Wallbox app starts via RemoteStartTransaction, Grizzl-E free-vend with own serial, Wallbox 8-measurand readings and clock-aligned lifetime readings, server time 40\,ms (was 3\,ms) and network 1\,ms (was 43\,ms), clock offset 0--0.35\,s (was $\pm$2\,s), Grizzl-E heartbeat without 62\,s mode, re-sent status keeps old timestamp.
+  \item Artefact found and fixed: ACN times are whole seconds $\Rightarrow$ plug-in/unplug frames arrived at exactly \texttt{.000}; added sub-second offset.
+  \item Validation v2: JPL March 2019, 12 chargers, $\sim$1.1\,M frames, 0 schema or consistency problems (Grizzl-E 05.x boot is schema-valid).
+  \item Code size: generator 401, profiles 119, validate 53, fetcher 121 lines.
+\end{itemize}
+
+\section{Calibration from real captures (ABB Terra 54, Grizzl-E)}
+\begin{itemize}
+  \item Method: tshark per TCP stream; request/response matched by message ID; network vs.\ server time split via CSMS empty TCP ACK.
+  \item Capture clock trustworthy: SteVe currentTime within $-25$\,ms over 2.3 days.
+  \item \textbf{Reboot}: ABB reboots on a strict 4\,h 01\,m schedule ($\sim$6/day, 21 intervals 4.015--4.053\,h) -- possibly operator-configured; replaces ``1 per 14 days''.
+  \item Reboot sequence (ABB): Unavailable on connectors 0--3 $\to$ charger closes WebSocket $\to$ offline 150\,$\pm$\,2\,s $\to$ Boot $\to$ status within 2--7\,s $\to$ transient Faulted/OtherError ($+11$\,s, $+20$\,s) $\to$ Available ($+31$\,s).
+  \item Queued StopTransaction sent as 2nd message after reboot, keeps original timestamp (153\,s old).
+  \item Reconnect without reboot: status for all connectors re-sent with original (hours-old) timestamps.
+  \item Grizzl-E: 6 server-initiated closes in 36.6\,h, bursty; reconnect after 10\,s (FIN) or 1\,s (RST); Boot $\sim$3.7\,s after SYN; Boot + 2 status on every reconnect.
+  \item \textbf{Clock}: ABB sawtooth drift $+25$\,ppm ($\sim$+0.33\,s after 4\,h), reset at boot; clock taken from BootNotification.conf currentTime.
+  \item \textbf{Heartbeat}: ABB 85\,\% 60.0\,s / 15\,\% 62.0\,s confirmed; Grizzl-E 60.0\,s $\pm$0.4\,s (no 62\,s mode).
+  \item Heartbeat timer reset only by the charger's own requests (n=2445).
+  \item \textbf{Latency correction}: network RTT only $\sim$1\,ms; the 43\,ms median is SteVe processing time (Heartbeat p50 39/p95 100\,ms, StartTransaction 105\,ms).
+  \item MeterValues (ABB DC): every 10.0\,s, only in transactions; Energy (integer Wh) + SoC; Transaction.Begin/End as separate MeterValues.
+  \item Message IDs (ABB): \texttt{"<bootCounter>:<seq>"}; seq restarts at Boot $\Rightarrow$ uuid4 everywhere is a fingerprint.
+  \item WebSocket pings: ABB 30.0\,s; Grizzl-E and server each 15\,s, offset $\sim$10\,s.
+  \item Not usable: ABB attack periods (gaps/short connections), Grizzl-E MeterValues (no charging traffic in pcap).
+\end{itemize}
+
+\section{Calibration from real charger logs (Home Assistant OCPP issues)}
+\begin{itemize}
+  \item Sources: issues \#176, \#442, \#880, \#906, \#994, \#1069, \#1684, \#1717, \#1742, \#1756, \#1767 (+ attachments); ABB 11 chargers / 7 sessions, Grizzl-E 6 / 2, Wallbox 14 / 5.
+  \item Caveat: most sessions remote-started by Home Assistant; intervals (heartbeat 3600, sample, clock) are set by HA, not the charger.
+  \item No real card-tap timing found $\Rightarrow$ 15\,s stays an assumption.
+  \item \textbf{Session order differs per vendor}: ABB sends Charging 0.8\,s \emph{before} StartTransaction and Finishing before StopTransaction; Wallbox Start $\to$ Charging +4--7\,s, Finishing $\to$ Stop $\to$ Available +20--50\,s; Grizzl-E Start $\to$ Charging +6--7\,s.
+  \item SuspendedEV when the car is full: not observed in these logs (kept as assumption; supported by ACN \texttt{doneChargingTime}).
+  \item \textbf{Session-relative energy}: ABB and Grizzl-E send \texttt{meterStart: 0} and count up per session; Wallbox reports the lifetime register.
+  \item MeterValues interval ABB 60\,s (not 30\,s), Grizzl-E 60\,s; ABB sends a separate Transaction.Begin MeterValues (energy 0) 3--10\,s after Start.
+  \item Wallbox measurands: Current L1/L2/L3 (``0.0'' on unused phases), Energy register + Interval, Power, Power.Offered, Frequency (no unit); StopTransaction always \texttt{transactionData: []}.
+  \item Wallbox clock-aligned readings on connectors 0 and 1, lifetime value, timestamp = start of interval (sent at its end); ``0.0'' only right after boot.
+  \item Wallbox Faulted on boot only on some boots (1 of 3 logs).
+  \item \textbf{Message IDs}: ABB 7-digit fixed sequence repeating after every boot; Grizzl-E (05.x) serial + 8 hex; Wallbox random decimal up to $2^{31}$.
+  \item Timestamps: ABB \texttt{.000Z}; Grizzl-E 05.x \texttt{.001Z}; Wallbox whole seconds.
+  \item Grizzl-E profile mixed two firmware generations (GWM-07 boot, 05.x message format) $\Rightarrow$ switched to consistent 05.x generation (model \texttt{GRS-*}, schema-valid).
+  \item Grizzl-E free-vend idTag = its own serial, Authorize 1--2\,s after plug-in.
+  \item Not modelled: ABB SecurityEventNotification at boot (SteVe lacks security extensions), ABB 4\,h reboot cycle (likely operator config of the DC unit).
+\end{itemize}
+
+\section{Attack (test) data}
+\begin{itemize}
+  \item Public attack data: CICEVSE2024 network/host attacks only (TLS, not convertible to OCPP messages); Federated dataset has 4 decodable OCPP attacks; Coventry only engineered features; no public billing-fraud or spoofing traffic.
+  \item Converting foreign attack captures into our format would let the model learn ``foreign environment'' instead of ``attack'' $\Rightarrow$ attacks are injected through the same generator (same profiles, IDs, timing); only the manipulation differs.
+  \item Optional later: Federated attacks as separate cross-environment test, reported as such.
+  \item \texttt{attacks.py}: billing fraud (energy/power/current and meterStop scaled to 50--80\,\%), cloned card (victim's tag at another idle charger during victim's session, curve copied from a real session), DoS flood (Heartbeat/Status at 5--20/s for 1--5\,min), spoofing (second device, other vendor fingerprint, same charger ID, 10--60\,min), replay (old StopTransaction re-sent 1--24\,h later).
+  \item Every frame labelled (\texttt{benign} or attack name); attacks are schema-valid OCPP.
+  \item Test week JPL 2019-03-15..21: 14 attacks, $\sim$1.08\,M frames, 1.2\,\% malicious frames (DoS 10\,226, billing fraud 1\,214, cloned card 968, spoofing 336, replay 10).
+  \item Scope: closed world -- all vendors seen in training; new-vendor generalisation (leave-one-vendor-out) as optional experiment.
+\end{itemize}
+
+\section{Features, model, infrastructure}
+\begin{itemize}
+  \item Data stays on own server (tarulo): ACN time series downloaded there; time-series files also serve as session source (contain all session fields).
+  \item Bug found: some sessions have measured current but no pilot signal $\Rightarrow$ keep current, offered current 32\,A.
+  \item Split by days (JPL 2019): train Jan 1--Feb 28 (benign), val Mar 1--7 (benign, threshold), test Mar 8--31 (benign + $\sim$2 attacks/day).
+  \item \texttt{features.py}: only requests (charger + backend calls); SteVe answers dropped. Per request: token (action + status / meter context / error flag) and 9 numbers: $\log(1+\Delta t)$, energy delta (kWh), power (kW), current (A/32), offered current (A/32), session energy at stop, idTag active at another charger, boot fingerprint differs from registry, transactionId not open on this charger.
+  \item Vendor format removed (message IDs, timestamp style, info texts, units, phase layout) $\Rightarrow$ model sees behaviour, not vendor.
+  \item Windows of 64 requests per charger, stride 16; window labelled malicious if any message is.
+  \item Model (\texttt{train.py}): LSTM autoencoder (embedding 16, hidden 64), loss = token cross-entropy + MSE of standardised numbers; trained on benign only.
+  \item Threshold = 99.5th percentile of benign validation scores; metrics per attack type: recall, ROC-AUC; overall FPR and precision. Labels used for evaluation only.
+  \item Training on AAU AI-LAB (Slurm, partition \texttt{l4}, NVIDIA L4, container \texttt{pytorch\_26.09.sif}); access via AAU VPN (openconnect) + SSH key.
+  \item Smoke test (1 epoch, 12 chargers, 1 week): pipeline works end-to-end on GPU; numbers not meaningful yet.
+  \item Dataset v1 (JPL 2019, 52 chargers): train 281\,737 / val 33\,221 / test 115\,746 windows; 48 attacks in test, 1\,926 attack windows (1.7\,\%); features only 29\,MB compressed.
+  \item \textbf{Run 1} (job 910981, 10 epochs, L4, minutes): train loss 0.80 $\to$ 0.49; threshold 99.5th pct of val; test FPR 0.57\,\%, precision 2.1\,\%.
+  \item Run 1 ROC-AUC: replay 0.99, DoS 0.98, spoofing 0.82, cloned card 0.78, billing fraud 0.70.
+  \item Run 1 recall at threshold $\approx$ 0 (replay 11\,\%, cloned card 3\,\%, others 0\,\%): scores rank attacks high but the threshold sits above them.
+  \item Diagnosis: window score = mean error over 64 positions $\times$ 9 numbers $\Rightarrow$ a single anomalous message (e.g. one flag) is diluted ($\sim$1/576); rare benign events (reboots, faults, outages) dominate the benign tail.
+  \item \textbf{Run 2} (job 910985): score = max error of a single message; never-firing flags = 10\,$\sigma$; event-level metrics added. Replay 11/11 events detected (AUC 0.999); FPR 0.50\,\%, precision 7.8\,\%; other attacks 0--1 of 8--9 events; threshold 8\,295 (abnormally high).
+  \item Diagnosis run 2: (a) sparse feature ``session energy at stop'' (non-zero in 0.06\,\%) had tiny std $\Rightarrow$ normal stops = 122\,$\sigma$; (b) ``transaction not open'' flag fired 2\,080$\times$ in benign train: Wallbox clock-aligned readings report a past interval and keep the transactionId after the session ended.
+  \item Fixes for run 3: sparse features scaled by their non-zero values (0 stays 0); transaction flag ignores clock-aligned readings.
+  \item \textbf{Run 3} (job 910995): threshold 77 (was 8\,295); FPR 0.37\,\%, precision 17.7\,\%. Events detected: replay 11/11, cloned card 5/8, spoofing 5/8, DoS 2/9, billing fraud 0/8. AUC: replay 1.00, DoS 0.97, spoofing 0.87, cloned card 0.80, billing fraud 0.72.
+  \item Diagnosis run 3: (a) spoofing missed when the charger never booted during training (no registered fingerprint); (b) cloned card missed when the victim charger is a Grizzl-E (uses its own serial, so the victim's card is never ``active'') -- attack design bug; (c) DoS is a rate pattern, a single fast Heartbeat is only $\sim$7\,$\sigma$; (d) billing fraud scales energy, power and current consistently $\Rightarrow$ looks plausible per message (expected; needs a second data source).
+\end{itemize}
+
+\section{Cross-environment evaluation (Federated OCPP 1.6 dataset)}
+\begin{itemize}
+  \item \texttt{federated.py}: real ABB Terra 54 + SteVe pcaps $\to$ our JSONL; MITM duplicates removed; several messages per TCP packet split. Attack 1 (charging-profile manipulation): 19\,279 frames, 6\,717 SetChargingProfile = attack. Attack 2 (denial of charge): 65\,956 frames, attacker RemoteStarts + the sessions they start = attack.
+  \item Run-3 model evaluated without retraining (\texttt{train.py --model}).
+  \item Window level not usable: attacker active every $\sim$30\,s $\Rightarrow$ every window contains an attack, no benign windows (FPR undefined).
+  \item \texttt{crosseval.py}: per-message scores (max over windows containing the message), same threshold.
+  \item Attack 1: benign requests flagged 5.8\,\%, attack requests 1.0\,\%, AUC 0.40.
+  \item Attack 2: benign requests flagged 1.0\,\%, attack requests 18.0\,\%, AUC 0.47; most flags on MeterValues/Transaction.End (a message type our profiles never produce).
+  \item Finding: the model does \emph{not} flag the foreign environment wholesale (benign 1--6\,\% vs.\ 0.4\,\% in-domain), but does not detect these attacks either (AUC $\approx$ random).
+  \item Reasons: (a) attack types not modelled (backend commands SetChargingProfile / RemoteStart are outside our charger-behaviour features); (b) unseen request types (SetChargingProfile, Reset, RemoteStop, Transaction.End) only add token cross-entropy ($\lesssim$20), far below the threshold (77) set by numeric errors $\Rightarrow$ novelty of message types is under-weighted.
+  \item Conclusion: in-domain results do not transfer to other attack types and environments; supports closed-world scope statement and motivates a ``request type never seen'' feature.
+\end{itemize}
+
+\section{Remaining assumptions}
+\begin{itemize}
+  \item Rare-event rates (outage 1/7\,d, reboot 1/14\,d, fault 1/30\,d, wrong card 3\,\%) and fault error codes -- no benign source.
+  \item Card-tap / app-start time ($\sim$15\,s); free-vend tag for ABB/Wallbox (charger serial, weak evidence).
+  \item Charger answer time to RemoteStart (0.1--0.5\,s); Available delay ABB and Grizzl-E.
+  \item SuspendedEV when the car is full (not seen in logs; implied by ACN \texttt{doneChargingTime}).
+  \item Network latency of a LAN (1\,ms); a cellular/WAN deployment would be slower.
+  \item Wallbox heartbeat jitter.
+\end{itemize}
+
+\section{Open}
+\begin{itemize}
+  \item Real benign data: own wallbox + SteVe; ask Federated/Coventry authors; companies contacted; AAU faculties.
+  \item \texttt{live.py} against SteVe; discriminator test.
+\end{itemize}
+
+\end{document}

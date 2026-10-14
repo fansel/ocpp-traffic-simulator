@@ -1,0 +1,10 @@
+data/
+.env
+.venv/
+__pycache__/
+.claude/settings.local.json
+.idea/
+*.iml
+*.aux
+*.log
+*.out
